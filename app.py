@@ -5,12 +5,12 @@ import streamlit as st
 
 TTL_SECONDS = 60
 
-st.set_page_config(page_title="KV Store Simulator (TTL)", layout="wide")
-st.title("🗄️ KV Store Simulator (Clave–Valor) + TTL")
-st.caption(f"Simulación de KV Store con expiración (TTL) de {TTL_SECONDS} segundos usando `st.session_state`.")
+st.set_page_config(page_title="KV Store Simulator (TTL + Infra)", layout="wide")
+st.title("🗄️ KV Store Simulator (Clave–Valor) + TTL + Infra Analytics")
+st.caption(f"KV Store en `st.session_state` con TTL={TTL_SECONDS}s y analítica de consumo (bytes).")
 
 # ---- Init store ----
-# Estructura: kv_store[key] = {"value": <dict>, "created_at": <epoch_seconds>}
+# kv_store[key] = {"value": <dict>, "created_at": <epoch_seconds>}
 if "kv_store" not in st.session_state:
     st.session_state["kv_store"] = {}
 
@@ -22,34 +22,49 @@ def now() -> float:
 def is_expired(created_at: float, ttl: int = TTL_SECONDS) -> bool:
     return (now() - created_at) > ttl
 
+def value_size_bytes(value: dict) -> int:
+    """
+    Tamaño aproximado en bytes del valor guardado.
+    Se mide como tamaño del JSON serializado (UTF-8).
+    """
+    try:
+        return len(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    except Exception:
+        # Fallback ultra defensivo
+        return len(str(value).encode("utf-8"))
+
 def cleanup_expired(ttl: int = TTL_SECONDS) -> int:
-    """Borra todas las claves expiradas y devuelve cuántas borró."""
     expired_keys = [k for k, v in kv_store.items() if is_expired(v["created_at"], ttl)]
     for k in expired_keys:
         del kv_store[k]
     return len(expired_keys)
 
 def build_status_table(ttl: int = TTL_SECONDS) -> pd.DataFrame:
-    """Construye una tabla con el estado de cada clave (Activa/Expirada)."""
+    """Tabla con estado (Activa/Expirada) + edad + bytes por clave."""
     rows = []
     t = now()
     for k, payload in kv_store.items():
         created_at = float(payload["created_at"])
         age = t - created_at
         expired = age > ttl
+
+        val = payload.get("value", {})
+        size_b = value_size_bytes(val)
+
         rows.append(
             {
-                "clave": k,
+                "cliente_id": k,
                 "estado": "Expirada" if expired else "Activa",
                 "edad_seg": int(age),
-                "ttl_seg": ttl,
                 "restante_seg": max(0, int(ttl - age)),
+                "size_bytes": int(size_b),
                 "created_at_epoch": int(created_at),
             }
         )
+
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values(["estado", "edad_seg"], ascending=[True, False]).reset_index(drop=True)
+        df = df.sort_values(["estado", "size_bytes"], ascending=[True, False]).reset_index(drop=True)
     return df
 
 left, right = st.columns(2, gap="large")
@@ -76,7 +91,6 @@ with left:
             value=json.dumps(example_value, indent=2, ensure_ascii=False),
             help="Debe ser un objeto JSON válido (dict)."
         )
-
         col_a, col_b = st.columns(2)
         submit_set = col_a.form_submit_button("Guardar (SET)")
         delete_key = col_b.form_submit_button("Borrar clave (DEL)")
@@ -93,6 +107,7 @@ with left:
                 else:
                     kv_store[k] = {"value": parsed_value, "created_at": now()}
                     st.success(f"✅ Guardado: clave `{k}` (TTL {TTL_SECONDS}s)")
+                    st.caption(f"Tamaño aprox del valor: {value_size_bytes(parsed_value)} bytes (JSON UTF-8)")
             except json.JSONDecodeError as e:
                 st.error(
                     "❌ JSON inválido. Revisa comillas, comas y llaves.\n\n"
@@ -119,8 +134,7 @@ with left:
             st.success(f"Se borraron **{removed}** claves expiradas (> {TTL_SECONDS}s).")
         else:
             st.info("No había claves expiradas para borrar.")
-
-    col_d.caption("La limpieza solo ocurre al pulsar el botón (simula un job/cron de mantenimiento).")
+    col_d.caption("La limpieza solo ocurre al pulsar el botón (simula un job/cron).")
 
     st.write(f"Claves almacenadas actualmente: **{len(kv_store)}**")
 
@@ -142,49 +156,60 @@ with right:
             payload = kv_store[k]
             created_at = payload["created_at"]
             expired = is_expired(created_at, TTL_SECONDS)
+            val = payload["value"]
 
             if expired:
-                st.warning(f"⚠️ La clave `{k}` está **EXPIRADA** (más de {TTL_SECONDS}s). Puedes limpiarla con el botón 🧹.")
+                st.warning(f"⚠️ La clave `{k}` está **EXPIRADA** (más de {TTL_SECONDS}s).")
             else:
                 st.success(f"✅ Encontrado: `{k}` (Activa)")
 
-            st.json(payload["value"])
+            st.json(val)
 
-            productos = payload["value"].get("productos")
-            if isinstance(productos, list) and len(productos) > 0:
-                try:
-                    df_prod = pd.json_normalize(productos)
-                    st.markdown("**Productos**")
-                    st.dataframe(df_prod, use_container_width=True)
-                except Exception:
-                    pass
-
-            total = payload["value"].get("precio_total")
-            if total is not None:
-                st.metric("Precio total", total)
-
+            # Métricas rápidas “infra”
             age = int(now() - created_at)
             st.caption(f"Edad del registro: **{age}s** | TTL: **{TTL_SECONDS}s**")
+            st.metric("Tamaño del valor (bytes)", value_size_bytes(val))
+
         else:
             st.warning(f"⚠️ No existe la clave `{k}` en el store.")
     else:
         st.info("Escribe una clave para ver su valor al instante.")
 
 # -------------------------
-# Estado visual del store
+# Estado + Infra Analytics
 # -------------------------
 st.divider()
 st.subheader("📋 Estado del KV Store (Activa vs Expirada)")
 
 status_df = build_status_table(TTL_SECONDS)
+
 if status_df.empty:
     st.info("No hay claves en el store todavía.")
 else:
+    # 1) Tabla estado + bytes
     st.dataframe(status_df, use_container_width=True)
 
+    # Métricas (conteos + tamaño total)
     expired_count = int((status_df["estado"] == "Expirada").sum())
     active_count = int((status_df["estado"] == "Activa").sum())
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Activas", active_count)
-    col2.metric("Expiradas", expired_count)
-    col3.metric("TTL (s)", TTL_SECONDS)
+    total_cache_bytes = int(status_df["size_bytes"].sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Activas", active_count)
+    c2.metric("Expiradas", expired_count)
+    c3.metric("TTL (s)", TTL_SECONDS)
+    # 3) Métrica total caché (bytes)
+    c4.metric("Peso total caché (bytes)", total_cache_bytes)
+
+    st.divider()
+    st.subheader("📊 Infra Analytics: consumo de memoria por cliente (aprox.)")
+
+    # 2) Bar chart: bytes por cliente
+    # st.bar_chart espera serie o df con índice; dejamos cliente_id como índice
+    mem_df = status_df[["cliente_id", "size_bytes"]].set_index("cliente_id")
+    st.bar_chart(mem_df)
+
+    st.caption(
+        "Nota: este cálculo es una **aproximación** basada en el tamaño del JSON serializado (UTF-8). "
+        "No representa exactamente el overhead interno de Python, pero es excelente para comparar consumo relativo por clave."
+    )
