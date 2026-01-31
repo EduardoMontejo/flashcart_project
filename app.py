@@ -1,17 +1,56 @@
-# app.py
 import json
-import streamlit as st
+import time
 import pandas as pd
+import streamlit as st
 
-st.set_page_config(page_title="KV Store Simulator", layout="wide")
-st.title("🗄️ KV Store Simulator (Clave–Valor)")
-st.caption("Simulación de una base de datos clave–valor usando `st.session_state`.")
+TTL_SECONDS = 60
 
-# 1) Inicializar el kv_store en session_state
+st.set_page_config(page_title="KV Store Simulator (TTL)", layout="wide")
+st.title("🗄️ KV Store Simulator (Clave–Valor) + TTL")
+st.caption(f"Simulación de KV Store con expiración (TTL) de {TTL_SECONDS} segundos usando `st.session_state`.")
+
+# ---- Init store ----
+# Estructura: kv_store[key] = {"value": <dict>, "created_at": <epoch_seconds>}
 if "kv_store" not in st.session_state:
-    st.session_state["kv_store"] = {}  # dict: { key (str) : value (dict) }
+    st.session_state["kv_store"] = {}
 
 kv_store = st.session_state["kv_store"]
+
+def now() -> float:
+    return time.time()
+
+def is_expired(created_at: float, ttl: int = TTL_SECONDS) -> bool:
+    return (now() - created_at) > ttl
+
+def cleanup_expired(ttl: int = TTL_SECONDS) -> int:
+    """Borra todas las claves expiradas y devuelve cuántas borró."""
+    expired_keys = [k for k, v in kv_store.items() if is_expired(v["created_at"], ttl)]
+    for k in expired_keys:
+        del kv_store[k]
+    return len(expired_keys)
+
+def build_status_table(ttl: int = TTL_SECONDS) -> pd.DataFrame:
+    """Construye una tabla con el estado de cada clave (Activa/Expirada)."""
+    rows = []
+    t = now()
+    for k, payload in kv_store.items():
+        created_at = float(payload["created_at"])
+        age = t - created_at
+        expired = age > ttl
+        rows.append(
+            {
+                "clave": k,
+                "estado": "Expirada" if expired else "Activa",
+                "edad_seg": int(age),
+                "ttl_seg": ttl,
+                "restante_seg": max(0, int(ttl - age)),
+                "created_at_epoch": int(created_at),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["estado", "edad_seg"], ascending=[True, False]).reset_index(drop=True)
+    return df
 
 left, right = st.columns(2, gap="large")
 
@@ -19,9 +58,8 @@ left, right = st.columns(2, gap="large")
 # SET: Guardar (formulario)
 # -------------------------
 with left:
-    st.subheader("1) SET — Guardar registro")
+    st.subheader("1) SET — Guardar registro (con timestamp)")
 
-    # JSON de ejemplo para ayudar al usuario
     example_value = {
         "productos": [
             {"sku": "A-100", "nombre": "Teclado", "cantidad": 1, "precio_unitario": 25.0},
@@ -36,7 +74,7 @@ with left:
             "Valor (JSON: productos + precio_total)",
             height=220,
             value=json.dumps(example_value, indent=2, ensure_ascii=False),
-            help="Debe ser un objeto JSON válido. Ej: {\"productos\": [...], \"precio_total\": 123.45}"
+            help="Debe ser un objeto JSON válido (dict)."
         )
 
         col_a, col_b = st.columns(2)
@@ -44,23 +82,17 @@ with left:
         delete_key = col_b.form_submit_button("Borrar clave (DEL)")
 
     if submit_set:
-        if not key.strip():
+        k = key.strip()
+        if not k:
             st.error("La **Clave (ID Cliente)** no puede estar vacía.")
         else:
             try:
                 parsed_value = json.loads(value_text)
-
                 if not isinstance(parsed_value, dict):
                     st.error("El **Valor** debe ser un **objeto JSON** (diccionario), no una lista.")
                 else:
-                    # Validación suave: esperamos productos y precio_total
-                    if "productos" not in parsed_value or "precio_total" not in parsed_value:
-                        st.warning(
-                            "Guardado, pero nota: el JSON idealmente debería incluir `productos` y `precio_total`."
-                        )
-
-                    kv_store[key.strip()] = parsed_value
-                    st.success(f"✅ Guardado: clave `{key.strip()}`")
+                    kv_store[k] = {"value": parsed_value, "created_at": now()}
+                    st.success(f"✅ Guardado: clave `{k}` (TTL {TTL_SECONDS}s)")
             except json.JSONDecodeError as e:
                 st.error(
                     "❌ JSON inválido. Revisa comillas, comas y llaves.\n\n"
@@ -78,12 +110,19 @@ with left:
             st.success(f"🗑️ Borrada la clave `{k}`")
 
     st.divider()
-    st.subheader("Estado del KV Store")
-    st.write(f"Claves almacenadas: **{len(kv_store)}**")
-    if kv_store:
-        st.write(list(kv_store.keys()))
-    else:
-        st.info("Aún no hay datos guardados.")
+    st.subheader("Mantenimiento TTL")
+
+    col_c, col_d = st.columns([1, 2])
+    if col_c.button("🧹 Limpiar expiradas"):
+        removed = cleanup_expired(TTL_SECONDS)
+        if removed > 0:
+            st.success(f"Se borraron **{removed}** claves expiradas (> {TTL_SECONDS}s).")
+        else:
+            st.info("No había claves expiradas para borrar.")
+
+    col_d.caption("La limpieza solo ocurre al pulsar el botón (simula un job/cron de mantenimiento).")
+
+    st.write(f"Claves almacenadas actualmente: **{len(kv_store)}**")
 
 # -------------------------
 # GET: Buscar (instantáneo)
@@ -100,30 +139,52 @@ with right:
     if search_key.strip():
         k = search_key.strip()
         if k in kv_store:
-            record = kv_store[k]
+            payload = kv_store[k]
+            created_at = payload["created_at"]
+            expired = is_expired(created_at, TTL_SECONDS)
 
-            st.success(f"✅ Encontrado: `{k}`")
-            st.json(record)
+            if expired:
+                st.warning(f"⚠️ La clave `{k}` está **EXPIRADA** (más de {TTL_SECONDS}s). Puedes limpiarla con el botón 🧹.")
+            else:
+                st.success(f"✅ Encontrado: `{k}` (Activa)")
 
-            # Vista tabular opcional si hay productos
-            productos = record.get("productos")
+            st.json(payload["value"])
+
+            productos = payload["value"].get("productos")
             if isinstance(productos, list) and len(productos) > 0:
                 try:
-                    df = pd.json_normalize(productos)
+                    df_prod = pd.json_normalize(productos)
                     st.markdown("**Productos**")
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(df_prod, use_container_width=True)
                 except Exception:
                     pass
 
-            total = record.get("precio_total")
+            total = payload["value"].get("precio_total")
             if total is not None:
                 st.metric("Precio total", total)
+
+            age = int(now() - created_at)
+            st.caption(f"Edad del registro: **{age}s** | TTL: **{TTL_SECONDS}s**")
         else:
             st.warning(f"⚠️ No existe la clave `{k}` en el store.")
-            # Sugerencia: autocompletar mental con claves parecidas
-            if kv_store:
-                st.caption("Claves disponibles (referencia):")
-                st.write(list(kv_store.keys()))
     else:
         st.info("Escribe una clave para ver su valor al instante.")
 
+# -------------------------
+# Estado visual del store
+# -------------------------
+st.divider()
+st.subheader("📋 Estado del KV Store (Activa vs Expirada)")
+
+status_df = build_status_table(TTL_SECONDS)
+if status_df.empty:
+    st.info("No hay claves en el store todavía.")
+else:
+    st.dataframe(status_df, use_container_width=True)
+
+    expired_count = int((status_df["estado"] == "Expirada").sum())
+    active_count = int((status_df["estado"] == "Activa").sum())
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Activas", active_count)
+    col2.metric("Expiradas", expired_count)
+    col3.metric("TTL (s)", TTL_SECONDS)
